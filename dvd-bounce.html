@@ -12,10 +12,9 @@
     }
     #stage {
       position: relative;
-      width: 100vw;
-      height: 100vh;
-      overflow: hidden;
+      /* we'll size this in JS to exact pixels so OBS always reports non-zero */
       background: transparent;
+      overflow: hidden;
     }
     .sprite {
       position: absolute;
@@ -31,27 +30,22 @@
 
 <script>
 (() => {
-  // ---------- Options ----------
   const OPTIONS = {
-    // assets
-    pngURL: "https://i.imgur.com/n6hDfJt.png",  // chair PNG (74x112)
-    gifURL: "https://i.imgur.com/6CXMtbT.gif",  // animated GIF (112x112)
-    tintColor: "#ffa500",                       // orange for rank 2
+    pngURL: "https://i.imgur.com/n6hDfJt.png",   // chair PNG (74x112)
+    gifURL: "https://i.imgur.com/6CXMtbT.gif",   // animated GIF (112x112)
+    tintColor: "#ffa500",                        // orange rank
 
-    // sizing: draw height; width keeps aspect
-    targetH: 112,
-
-    // motion & behavior
+    targetH: 112,         // drawn height (px), width keeps aspect
     startCount: 3,
-    maxCount: 6,              // hard cap you asked for
-    startSpeed: 280,          // px/s
-    boostOnCorner: 1.06,      // 6% bump each perfect corner
-    maxSpeed: 800,            // clamp
-    cornerCooldownMs: 350,    // per-sprite debounce
-    minAngleSeparationDeg: 12 // reduce duplicate directions at spawn
+    maxCount: 6,          // hard cap
+    startSpeed: 280,      // px/s
+    boostOnCorner: 1.06,  // 6% bump per perfect corner
+    maxSpeed: 800,        // clamp
+    cornerCooldownMs: 350,
+    minAngleSeparationDeg: 12
   };
 
-  // URL overrides (optional): ?start=3&max=6&h=112&speed=300&boost=1.08&cap=900&png=...&gif=...&color=%23ff6a00
+  // Optional URL overrides
   const qs = new URLSearchParams(location.search);
   if (qs.has("start")) OPTIONS.startCount = Math.max(1, +qs.get("start"));
   if (qs.has("max"))   OPTIONS.maxCount   = Math.max(1, +qs.get("max"));
@@ -65,12 +59,29 @@
 
   const stage = document.getElementById("stage");
 
-  // ---------- Load base PNG first, then make tint, then load GIF ----------
+  // Ensure stage always has real pixel size (fixes 0x0 spawn bug in OBS)
+  function sizeStageToWindow() {
+    const w = Math.max(1, Math.floor(window.innerWidth));
+    const h = Math.max(1, Math.floor(window.innerHeight));
+    stage.style.width  = w + "px";
+    stage.style.height = h + "px";
+    return { w, h };
+  }
+  sizeStageToWindow();
+  addEventListener("resize", sizeStageToWindow);
+
+  // Helpers to read current stage size
+  const W = () => stage.clientWidth  || Math.max(1, Math.floor(window.innerWidth));
+  const H = () => stage.clientHeight || Math.max(1, Math.floor(window.innerHeight));
+
+  // Image loading with CORS so Imgur is happy
   function loadImg(src) {
     return new Promise((res, rej) => {
       const img = new Image();
+      img.decoding = "async";
+      img.crossOrigin = "anonymous";
       img.onload = () => res(img);
-      img.onerror = rej;
+      img.onerror = (e) => rej(e);
       img.src = src;
     });
   }
@@ -92,60 +103,51 @@
   Promise.all([loadImg(OPTIONS.pngURL), loadImg(OPTIONS.gifURL)]).then(([basePNG, gifIMG]) => {
     const orangeDataURL = makeTinted(basePNG, OPTIONS.tintColor);
 
-    // Natural sizes
     const baseW = basePNG.naturalWidth || basePNG.width;
     const baseH = basePNG.naturalHeight || basePNG.height;
     const gifW  = gifIMG.naturalWidth  || gifIMG.width;
     const gifH  = gifIMG.naturalHeight || gifIMG.height;
 
-    // Target sizes (preserve aspect)
-    const PNG_W  = Math.round(baseW * (OPTIONS.targetH / baseH));
-    const PNG_H  = OPTIONS.targetH;
-    const GIF_W  = Math.round(gifW  * (OPTIONS.targetH / gifH));
-    const GIF_H  = OPTIONS.targetH;
+    const PNG_W = Math.round(baseW * (OPTIONS.targetH / baseH));
+    const PNG_H = OPTIONS.targetH;
+    const GIF_W = Math.round(gifW  * (OPTIONS.targetH / gifH));
+    const GIF_H = OPTIONS.targetH;
 
-    // Stage helpers
+    // Physics + sprites
+    const sprites = [];
     const EPS = 0.75;
-    const W = () => stage.clientWidth;
-    const H = () => stage.clientHeight;
 
     function clampedSpeed(vx, vy) {
       const mag = Math.hypot(vx, vy) || 1;
-      if (mag <= OPTIONS.maxSpeed) return {vx, vy};
+      if (mag <= OPTIONS.maxSpeed) return { vx, vy };
       const k = OPTIONS.maxSpeed / mag;
-      return {vx: vx * k, vy: vy * k};
+      return { vx: vx * k, vy: vy * k };
     }
-
-    function setSpeedMag(sprite, newMag) {
-      const cur = Math.hypot(sprite.vx, sprite.vy) || 1;
+    function setSpeedMag(s, newMag) {
+      const cur = Math.hypot(s.vx, s.vy) || 1;
       const k = newMag / cur;
-      let vx = sprite.vx * k, vy = sprite.vy * k;
+      let vx = s.vx * k, vy = s.vy * k;
       ({vx, vy} = clampedSpeed(vx, vy));
-      sprite.vx = vx; sprite.vy = vy;
+      s.vx = vx; s.vy = vy;
     }
+    function atEdgeX(x, w) { return Math.abs(x - 0) <= EPS || Math.abs(x - (W() - w)) <= EPS; }
+    function atEdgeY(y, h) { return Math.abs(y - 0) <= EPS || Math.abs(y - (H() - h)) <= EPS; }
 
-    function atEdgeX(x, w) {
-      return Math.abs(x - 0) <= EPS || Math.abs(x - (W() - w)) <= EPS;
-    }
-    function atEdgeY(y, h) {
-      return Math.abs(y - 0) <= EPS || Math.abs(y - (H() - h)) <= EPS;
-    }
-
-    // Stage 0 = PNG, 1 = orange PNG, 2 = GIF (animated). They only rank up on perfect corner.
-    function applyStage(sprite) {
-      if (sprite.stage === 0) {
-        sprite.el.src = OPTIONS.pngURL;
-        sprite.w = PNG_W; sprite.h = PNG_H;
-      } else if (sprite.stage === 1) {
-        sprite.el.src = orangeDataURL;
-        sprite.w = PNG_W; sprite.h = PNG_H;
+    function applyStage(s) {
+      // 0 = PNG, 1 = orange PNG, 2 = GIF
+      if (s.stage === 0) {
+        s.el.src = OPTIONS.pngURL; s.w = PNG_W; s.h = PNG_H;
+      } else if (s.stage === 1) {
+        s.el.src = orangeDataURL;  s.w = PNG_W; s.h = PNG_H;
       } else {
-        sprite.el.src = OPTIONS.gifURL;
-        sprite.w = GIF_W; sprite.h = GIF_H;
+        s.el.src = OPTIONS.gifURL; s.w = GIF_W; s.h = GIF_H;
       }
-      // Apply size via CSS to ensure DOM img matches our math
-      sprite.el.style.width = sprite.w + "px";
-      sprite.el.style.height = sprite.h + "px";
+      s.el.style.width  = s.w + "px";
+      s.el.style.height = s.h + "px";
+    }
+
+    function rectOverlap(a, b) {
+      return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
     }
 
     function randomAngleSeparated(prevAngle) {
@@ -157,144 +159,156 @@
       return a;
     }
 
-    const sprites = [];
-
-    function rectOverlap(a, b) {
-      return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
-    }
-
-    function spawn(stageSeed = 0, prevAngle = null, attempts = 16) {
-      // build DOM node
+    function spawn(prevAngle = null, attempts = 24) {
       const el = document.createElement("img");
       el.className = "sprite";
       stage.appendChild(el);
 
-      const sprite = {
-        el,
-        stage: stageSeed % 3, // all start as 0; we’ll pass 0 at init per your spec
-        x: 0, y: 0,
-        w: PNG_W, h: PNG_H,
+      const s = {
+        el, stage: 0, // start as chair
+        x: 0, y: 0, w: PNG_W, h: PNG_H,
         vx: 0, vy: 0,
         cooldownUntil: 0
       };
-      sprite.stage = 0; // force start at chair PNG
-      applyStage(sprite);
+      applyStage(s);
 
-      // random non-overlapping position
       const pad = 3;
-      for (let t = 0; t < attempts; t++) {
-        const nx = Math.random() * Math.max(1, (W() - sprite.w - pad*2)) + pad;
-        const ny = Math.random() * Math.max(1, (H() - sprite.h - pad*2)) + pad;
-        let collides = false;
-        for (const s of sprites) {
-          if (rectOverlap({x:nx,y:ny,w:sprite.w,h:sprite.h}, s)) { collides = true; break; }
-        }
-        if (!collides) { sprite.x = nx; sprite.y = ny; break; }
+      const width  = W();
+      const height = H();
+
+      // If stage somehow still 0x0, delay spawn a tick
+      if (width <= 0 || height <= 0) {
+        requestAnimationFrame(() => spawn(prevAngle, attempts));
+        el.remove();
+        return null;
       }
 
-      // velocity
+      for (let t = 0; t < attempts; t++) {
+        const nx = Math.random() * Math.max(1, (width - s.w - pad * 2)) + pad;
+        const ny = Math.random() * Math.max(1, (height - s.h - pad * 2)) + pad;
+        let collides = false;
+        for (const o of sprites) {
+          if (rectOverlap({ x: nx, y: ny, w: s.w, h: s.h }, o)) { collides = true; break; }
+        }
+        if (!collides) { s.x = nx; s.y = ny; break; }
+      }
+
       const a = randomAngleSeparated(prevAngle);
       let vx = Math.cos(a) * OPTIONS.startSpeed;
       let vy = Math.sin(a) * OPTIONS.startSpeed;
-      ({vx, vy} = clampedSpeed(vx, vy));
-      sprite.vx = vx; sprite.vy = vy;
+      ({ vx, vy } = clampedSpeed(vx, vy));
+      s.vx = vx; s.vy = vy;
 
-      sprites.push(sprite);
-      return sprite;
+      sprites.push(s);
+      return s;
     }
 
-    // seed with exactly 3
-    let prevA = null;
-    for (let i = 0; i < OPTIONS.startCount; i++) {
-      const s = spawn(0, prevA);
-      prevA = Math.atan2(s.vy, s.vx);
+    // Wait until stage has size, then seed exactly 3
+    function seedWhenReady() {
+      if (W() > 0 && H() > 0) {
+        let prevA = null;
+        for (let i = 0; i < OPTIONS.startCount; i++) {
+          const s = spawn(prevA);
+          if (s) prevA = Math.atan2(s.vy, s.vx);
+        }
+        startLoop();
+      } else {
+        requestAnimationFrame(seedWhenReady);
+      }
     }
 
-    // physics loop
     let last = performance.now();
+    function startLoop() {
+      function tick(now) {
+        const dt = (now - last) / 1000;
+        last = now;
 
-    function tick(now) {
-      const dt = (now - last) / 1000;
-      last = now;
+        // Move + wall bounces
+        for (const s of sprites) {
+          let nx = s.x + s.vx * dt;
+          let ny = s.y + s.vy * dt;
 
-      // move + wall bounces
-      for (const s of sprites) {
-        let nx = s.x + s.vx * dt;
-        let ny = s.y + s.vy * dt;
+          let hitX = false, hitY = false;
 
-        let hitX = false, hitY = false;
+          if (nx <= 0) { nx = 0; s.vx = Math.abs(s.vx); hitX = true; }
+          else if (nx + s.w >= W()) { nx = W() - s.w; s.vx = -Math.abs(s.vx); hitX = true; }
 
-        if (nx <= 0) { nx = 0; s.vx = Math.abs(s.vx); hitX = true; }
-        else if (nx + s.w >= W()) { nx = W() - s.w; s.vx = -Math.abs(s.vx); hitX = true; }
+          if (ny <= 0) { ny = 0; s.vy = Math.abs(s.vy); hitY = true; }
+          else if (ny + s.h >= H()) { ny = H() - s.h; s.vy = -Math.abs(s.vy); hitY = true; }
 
-        if (ny <= 0) { ny = 0; s.vy = Math.abs(s.vy); hitY = true; }
-        else if (ny + s.h >= H()) { ny = H() - s.h; s.vy = -Math.abs(s.vy); hitY = true; }
+          s.x = nx; s.y = ny;
 
-        s.x = nx; s.y = ny;
+          const corner = (hitX && hitY) || (atEdgeX(s.x, s.w) && atEdgeY(s.y, s.h));
+          if (corner && now >= s.cooldownUntil) {
+            // rank up
+            s.stage = (s.stage + 1) % 3;
+            const oldW = s.w, oldH = s.h;
+            applyStage(s);
 
-        const corner = (hitX && hitY) || (atEdgeX(s.x, s.w) && atEdgeY(s.y, s.h));
-        if (corner && now >= s.cooldownUntil) {
-          // rank up: 0 -> 1 -> 2 -> 0 ...
-          s.stage = (s.stage + 1) % 3;
-          applyStage(s);
+            // Keep inside if size changed
+            if (s.x + s.w > W()) s.x = W() - s.w;
+            if (s.y + s.h > H()) s.y = H() - s.h;
 
-          // speed boost
-          const boosted = Math.min(OPTIONS.maxSpeed, Math.hypot(s.vx, s.vy) * OPTIONS.boostOnCorner);
-          setSpeedMag(s, boosted);
+            // speed boost
+            const boosted = Math.min(OPTIONS.maxSpeed, Math.hypot(s.vx, s.vy) * OPTIONS.boostOnCorner);
+            setSpeedMag(s, boosted);
 
-          // spawn new if under cap
-          if (sprites.length < OPTIONS.maxCount) {
-            const newbie = spawn(0, Math.atan2(s.vy, s.vx));
+            // spawn new until cap
+            if (sprites.length < OPTIONS.maxCount) {
+              spawn(Math.atan2(s.vy, s.vx));
+            }
+
+            s.cooldownUntil = now + OPTIONS.cornerCooldownMs;
           }
-
-          // debounce
-          s.cooldownUntil = now + OPTIONS.cornerCooldownMs;
         }
-      }
 
-      // pairwise AABB collisions with simple elastic response
-      for (let i = 0; i < sprites.length; i++) {
-        for (let j = i + 1; j < sprites.length; j++) {
-          const A = sprites[i], B = sprites[j];
-          if (!rectOverlap(A, B)) continue;
+        // Pairwise AABB collisions
+        for (let i = 0; i < sprites.length; i++) {
+          for (let j = i + 1; j < sprites.length; j++) {
+            const A = sprites[i], B = sprites[j];
+            if (!rectOverlap(A, B)) continue;
 
-          const axC = A.x + A.w / 2, ayC = A.y + A.h / 2;
-          const bxC = B.x + B.w / 2, byC = B.y + B.h / 2;
+            const axC = A.x + A.w / 2, ayC = A.y + A.h / 2;
+            const bxC = B.x + B.w / 2, byC = B.y + B.h / 2;
 
-          const overlapX = (A.w + B.w) / 2 - Math.abs(axC - bxC);
-          const overlapY = (A.h + B.h) / 2 - Math.abs(ayC - byC);
-          if (overlapX <= 0 || overlapY <= 0) continue;
+            const overlapX = (A.w + B.w) / 2 - Math.abs(axC - bxC);
+            const overlapY = (A.h + B.h) / 2 - Math.abs(ayC - byC);
+            if (overlapX <= 0 || overlapY <= 0) continue;
 
-          if (overlapX < overlapY) {
-            const push = overlapX / 2 + 0.1;
-            if (axC < bxC) { A.x -= push; B.x += push; }
-            else { A.x += push; B.x -= push; }
-            const tmp = A.vx; A.vx = B.vx; B.vx = tmp;
-          } else {
-            const push = overlapY / 2 + 0.1;
-            if (ayC < byC) { A.y -= push; B.y += push; }
-            else { A.y += push; B.y -= push; }
-            const tmp = A.vy; A.vy = B.vy; B.vy = tmp;
+            if (overlapX < overlapY) {
+              const push = overlapX / 2 + 0.1;
+              if (axC < bxC) { A.x -= push; B.x += push; }
+              else { A.x += push; B.x -= push; }
+              const tvx = A.vx; A.vx = B.vx; B.vx = tvx;
+            } else {
+              const push = overlapY / 2 + 0.1;
+              if (ayC < byC) { A.y -= push; B.y += push; }
+              else { A.y += push; B.y -= push; }
+              const tvy = A.vy; A.vy = B.vy; B.vy = tvy;
+            }
+
+            ({ vx: A.vx, vy: A.vy } = clampedSpeed(A.vx, A.vy));
+            ({ vx: B.vx, vy: B.vy } = clampedSpeed(B.vx, B.vy));
           }
-
-          // clamp speeds
-          ({vx: A.vx, vy: A.vy} = clampedSpeed(A.vx, A.vy));
-          ({vx: B.vx, vy: B.vy} = clampedSpeed(B.vx, B.vy));
         }
-      }
 
-      // draw (via CSS transform so GIFs animate naturally)
-      for (const s of sprites) {
-        s.el.style.transform = `translate(${Math.round(s.x)}px, ${Math.round(s.y)}px)`;
-      }
+        // Draw
+        for (const s of sprites) {
+          s.el.style.transform = `translate(${Math.round(s.x)}px, ${Math.round(s.y)}px)`;
+        }
 
+        requestAnimationFrame(tick);
+      }
       requestAnimationFrame(tick);
     }
 
-    requestAnimationFrame(tick);
+    // Kick everything off after stage has non-zero size
+    seedWhenReady();
+
   }).catch(err => {
     console.error("Asset load failed:", err);
-    // visual fallback: a single bouncing div so OBS isn't blank
+    // emergency fallback block
+    sizeStageToWindow();
     const box = document.createElement("div");
     box.style.position = "absolute";
     box.style.width = "100px";
@@ -304,10 +318,10 @@
     let x=10,y=10,vx=200,vy=160,last=performance.now();
     function loop(now){
       const dt=(now-last)/1000; last=now;
+      const width=W(), height=H();
       x+=vx*dt; y+=vy*dt;
-      const W=stage.clientWidth,H=stage.clientHeight;
-      if(x<0||x+100>W)vx*=-1;
-      if(y<0||y+100>H)vy*=-1;
+      if(x<0||x+100>width)vx*=-1;
+      if(y<0||y+100>height)vy*=-1;
       box.style.transform=`translate(${x}px,${y}px)`;
       requestAnimationFrame(loop);
     }
