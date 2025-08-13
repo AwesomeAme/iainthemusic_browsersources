@@ -1,0 +1,232 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>DVD Bounce Overlay</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  // ---------- Customize ----------
+  const OPTIONS = {
+    // Your assets
+    pngURL: "https://i.imgur.com/n6hDfJt.png",  // 74x112 PNG
+    gifURL: "https://i.imgur.com/6CXMtbT.gif",  // 112x112 GIF
+
+    // Size control: icon will be drawn at this target HEIGHT, width keeps aspect automatically
+    iconTargetHeight: 112,
+
+    // Motion
+    speed: 280,             // pixels per second
+    cornerCooldownMs: 400,  // debounce so one corner counts once
+
+    // Tints
+    orange: "#ffa500",
+    purple: "#9b5de5"
+  };
+
+  // Optional URL overrides:
+  // ?h=128&speed=360&png=URL&gif=URL
+  const qs = new URLSearchParams(location.search);
+  if (qs.has("h"))     OPTIONS.iconTargetHeight = Math.max(8, +qs.get("h") || OPTIONS.iconTargetHeight);
+  if (qs.has("speed")) OPTIONS.speed = Math.max(20, +qs.get("speed") || OPTIONS.speed);
+  if (qs.has("png"))   OPTIONS.pngURL = qs.get("png");
+  if (qs.has("gif"))   OPTIONS.gifURL = qs.get("gif");
+
+  // ---------- Canvas setup ----------
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: true });
+
+  function resizeCanvas() {
+    canvas.width  = Math.floor(window.innerWidth  * devicePixelRatio);
+    canvas.height = Math.floor(window.innerHeight * devicePixelRatio);
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  }
+  resizeCanvas();
+  addEventListener("resize", resizeCanvas);
+
+  // ---------- Load images ----------
+  function loadImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.decoding = "async";
+      img.crossOrigin = "anonymous";
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+
+  // Pre-tint helper uses offscreen canvas and caches results
+  function makeTinted(img, color) {
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    const off = document.createElement("canvas");
+    off.width = w;
+    off.height = h;
+    const octx = off.getContext("2d");
+    octx.drawImage(img, 0, 0, w, h);
+    octx.globalCompositeOperation = "source-atop";
+    octx.fillStyle = color;
+    octx.globalAlpha = 1.0;
+    octx.fillRect(0, 0, w, h);
+    octx.globalCompositeOperation = "source-over";
+    octx.globalAlpha = 1.0;
+    const tinted = new Image();
+    tinted.src = off.toDataURL("image/png");
+    return tinted;
+  }
+
+  Promise.all([loadImage(OPTIONS.pngURL), loadImage(OPTIONS.gifURL)])
+    .then(([basePNG, gifIMG]) => {
+      // Prepare tinted variants once
+      const tintedOrange = makeTinted(basePNG, OPTIONS.orange);
+      const tintedPurple = makeTinted(basePNG, OPTIONS.purple);
+
+      // Stage mapping:
+      // 0 normal PNG, 1 orange, 2 purple, 3 GIF
+      function currentIconForStage(stage) {
+        switch (stage) {
+          case 1: return tintedOrange;
+          case 2: return tintedPurple;
+          case 3: return gifIMG;
+          default: return basePNG;
+        }
+      }
+
+      // Icon sizing based on current sprite aspect, target height fixed
+      function sizeFor(img) {
+        const iw = img.naturalWidth || img.width;
+        const ih = img.naturalHeight || img.height;
+        const targetH = OPTIONS.iconTargetHeight;
+        const targetW = Math.max(1, Math.round(iw * (targetH / ih)));
+        return { w: targetW, h: targetH };
+      }
+
+      // ---------- Motion ----------
+      let cornerHits = 0;
+      let stage = 0; // 0..3 cycles
+      let icon = currentIconForStage(stage);
+      let iconSize = sizeFor(icon);
+
+      function updateStage() {
+        stage = (cornerHits % 4);
+        icon = currentIconForStage(stage);
+        iconSize = sizeFor(icon);
+      }
+
+      const EPS = 0.75; // sub-pixel tolerance
+      let cooldownUntil = 0;
+
+      // Start position and velocity
+      let W = () => window.innerWidth;
+      let H = () => window.innerHeight;
+
+      // place away from edges
+      let x = Math.random() * Math.max(1, (W() - iconSize.w - 1)) + 0.5;
+      let y = Math.random() * Math.max(1, (H() - iconSize.h - 1)) + 0.5;
+
+      function randomVelocity(speed) {
+        const a = Math.random() * Math.PI * 2;
+        return { vx: Math.cos(a) * speed, vy: Math.sin(a) * speed };
+      }
+      let { vx, vy } = randomVelocity(OPTIONS.speed);
+
+      function atEdgeX(px, w) {
+        return Math.abs(px - 0) <= EPS || Math.abs(px - (W() - w)) <= EPS;
+      }
+      function atEdgeY(py, h) {
+        return Math.abs(py - 0) <= EPS || Math.abs(py - (H() - h)) <= EPS;
+      }
+
+      let last = performance.now();
+
+      function loop(now) {
+        const dt = (now - last) / 1000;
+        last = now;
+
+        let nx = x + vx * dt;
+        let ny = y + vy * dt;
+
+        let hitX = false, hitY = false;
+
+        // Reflect X
+        if (nx <= 0) {
+          nx = 0;
+          vx = Math.abs(vx);
+          hitX = true;
+        } else if (nx + iconSize.w >= W()) {
+          nx = W() - iconSize.w;
+          vx = -Math.abs(vx);
+          hitX = true;
+        }
+
+        // Reflect Y
+        if (ny <= 0) {
+          ny = 0;
+          vy = Math.abs(vy);
+          hitY = true;
+        } else if (ny + iconSize.h >= H()) {
+          ny = H() - iconSize.h;
+          vy = -Math.abs(vy);
+          hitY = true;
+        }
+
+        x = nx;
+        y = ny;
+
+        // Corner detection with cooldown
+        const isCorner = (hitX && hitY) || (atEdgeX(x, iconSize.w) && atEdgeY(y, iconSize.h));
+        if (isCorner && now >= cooldownUntil) {
+          cornerHits += 1;
+          updateStage();
+          cooldownUntil = now + OPTIONS.cornerCooldownMs;
+        }
+
+        // Draw
+        ctx.clearRect(0, 0, W(), H());
+        if (icon && icon.complete) {
+          ctx.drawImage(icon, Math.round(x), Math.round(y), iconSize.w, iconSize.h);
+        }
+
+        requestAnimationFrame(loop);
+      }
+
+      // Start when first icon is ready
+      requestAnimationFrame(loop);
+    })
+    .catch(err => {
+      console.error("Failed to load images", err);
+      // Minimal fallback to avoid a blank source
+      let last = performance.now(), x = 10, y = 10, vx = 200, vy = 160, w = 100, h = 100;
+      function loop(now) {
+        const dt = (now - last) / 1000; last = now;
+        x += vx * dt; y += vy * dt;
+        if (x < 0 || x + w > window.innerWidth)  vx *= -1;
+        if (y < 0 || y + h > window.innerHeight) vy *= -1;
+        const ctx = c.getContext("2d");
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.fillRect(x, y, w, h);
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+    });
+})();
+</script>
+</body>
+</html>
