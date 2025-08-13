@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>DVD Bounce Overlay — Swarm</title>
+  <title>DVD Bounce — Swarm (DOM)</title>
   <style>
     html, body {
       margin: 0;
@@ -10,109 +10,143 @@
       background: transparent;
       overflow: hidden;
     }
-    canvas {
-      display: block;
+    #stage {
+      position: relative;
       width: 100vw;
       height: 100vh;
+      overflow: hidden;
+      background: transparent;
+    }
+    .sprite {
+      position: absolute;
+      will-change: transform;
+      image-rendering: auto;
+      pointer-events: none;
+      user-select: none;
     }
   </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<div id="stage"></div>
+
 <script>
 (() => {
   // ---------- Options ----------
   const OPTIONS = {
-    pngURL: "https://i.imgur.com/n6hDfJt.png",   // 74x112 PNG
-    gifURL: "https://i.imgur.com/6CXMtbT.gif",   // 112x112 animated GIF
-    iconTargetHeight: 112,                       // draw height; width keeps aspect
-    tintColor: "#ffa500",
+    // assets
+    pngURL: "https://i.imgur.com/n6hDfJt.png",  // chair PNG (74x112)
+    gifURL: "https://i.imgur.com/6CXMtbT.gif",  // animated GIF (112x112)
+    tintColor: "#ffa500",                       // orange for rank 2
 
-    // Spawn and limits
+    // sizing: draw height; width keeps aspect
+    targetH: 112,
+
+    // motion & behavior
     startCount: 3,
-    maxCount: 30,             // safety cap so it doesn't become chaos soup
-    spawnOnCorner: true,
-
-    // Motion
+    maxCount: 6,              // hard cap you asked for
     startSpeed: 280,          // px/s
-    cornerSpeedBoost: 1.06,   // 6% per perfect corner
-    maxSpeed: 800,            // speed cap
+    boostOnCorner: 1.06,      // 6% bump each perfect corner
+    maxSpeed: 800,            // clamp
     cornerCooldownMs: 350,    // per-sprite debounce
-    minAngleSeparationDeg: 12 // reduce identical initial angles
+    minAngleSeparationDeg: 12 // reduce duplicate directions at spawn
   };
 
-  // URL overrides, example:
-  // ?start=3&max=25&h=128&speed=320&boost=1.08&cap=900&png=...&gif=...&color=%23ff6a00
+  // URL overrides (optional): ?start=3&max=6&h=112&speed=300&boost=1.08&cap=900&png=...&gif=...&color=%23ff6a00
   const qs = new URLSearchParams(location.search);
-  if (qs.has("start")) OPTIONS.startCount = Math.max(1, +qs.get("start") || OPTIONS.startCount);
-  if (qs.has("max"))   OPTIONS.maxCount   = Math.max(1, +qs.get("max")   || OPTIONS.maxCount);
-  if (qs.has("h"))     OPTIONS.iconTargetHeight = Math.max(8, +qs.get("h") || OPTIONS.iconTargetHeight);
-  if (qs.has("speed")) OPTIONS.startSpeed = Math.max(20, +qs.get("speed") || OPTIONS.startSpeed);
-  if (qs.has("boost")) OPTIONS.cornerSpeedBoost = Math.max(1.0, +qs.get("boost") || OPTIONS.cornerSpeedBoost);
-  if (qs.has("cap"))   OPTIONS.maxSpeed   = Math.max(OPTIONS.startSpeed, +qs.get("cap") || OPTIONS.maxSpeed);
-  if (qs.has("png"))   OPTIONS.pngURL = qs.get("png");
-  if (qs.has("gif"))   OPTIONS.gifURL = qs.get("gif");
-  if (qs.has("color")) OPTIONS.tintColor = qs.get("color");
+  if (qs.has("start")) OPTIONS.startCount = Math.max(1, +qs.get("start"));
+  if (qs.has("max"))   OPTIONS.maxCount   = Math.max(1, +qs.get("max"));
+  if (qs.has("h"))     OPTIONS.targetH    = Math.max(8, +qs.get("h"));
+  if (qs.has("speed")) OPTIONS.startSpeed = Math.max(20, +qs.get("speed"));
+  if (qs.has("boost")) OPTIONS.boostOnCorner = Math.max(1.0, +qs.get("boost"));
+  if (qs.has("cap"))   OPTIONS.maxSpeed   = Math.max(OPTIONS.startSpeed, +qs.get("cap"));
+  if (qs.has("png"))   OPTIONS.pngURL     = qs.get("png");
+  if (qs.has("gif"))   OPTIONS.gifURL     = qs.get("gif");
+  if (qs.has("color")) OPTIONS.tintColor  = qs.get("color");
 
-  // ---------- Canvas ----------
-  const canvas = document.getElementById("c");
-  const ctx = canvas.getContext("2d", { alpha: true });
-  function resizeCanvas() {
-    canvas.width  = Math.floor(window.innerWidth  * devicePixelRatio);
-    canvas.height = Math.floor(window.innerHeight * devicePixelRatio);
-    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
-  }
-  resizeCanvas();
-  addEventListener("resize", resizeCanvas);
+  const stage = document.getElementById("stage");
 
-  // ---------- Asset loading ----------
-  function loadImage(url) {
-    return new Promise((resolve, reject) => {
+  // ---------- Load base PNG first, then make tint, then load GIF ----------
+  function loadImg(src) {
+    return new Promise((res, rej) => {
       const img = new Image();
-      img.decoding = "async";
-      img.crossOrigin = "anonymous";
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = url;
+      img.onload = () => res(img);
+      img.onerror = rej;
+      img.src = src;
     });
   }
 
-  function tintImage(img, color) {
-    const w = img.naturalWidth || img.width;
-    const h = img.naturalHeight || img.height;
+  function makeTinted(srcImg, color) {
+    const w = srcImg.naturalWidth || srcImg.width;
+    const h = srcImg.naturalHeight || srcImg.height;
     const off = document.createElement("canvas");
     off.width = w; off.height = h;
-    const octx = off.getContext("2d");
-    octx.drawImage(img, 0, 0, w, h);
-    octx.globalCompositeOperation = "source-atop";
-    octx.fillStyle = color;
-    octx.fillRect(0, 0, w, h);
-    octx.globalCompositeOperation = "source-over";
-    const out = new Image();
-    out.src = off.toDataURL("image/png");
-    return out;
+    const ctx = off.getContext("2d");
+    ctx.drawImage(srcImg, 0, 0, w, h);
+    ctx.globalCompositeOperation = "source-atop";
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = "source-over";
+    return off.toDataURL("image/png");
   }
 
-  Promise.all([loadImage(OPTIONS.pngURL), loadImage(OPTIONS.gifURL)]).then(([basePNG, gifIMG]) => {
-    const orangePNG = tintImage(basePNG, OPTIONS.tintColor);
+  Promise.all([loadImg(OPTIONS.pngURL), loadImg(OPTIONS.gifURL)]).then(([basePNG, gifIMG]) => {
+    const orangeDataURL = makeTinted(basePNG, OPTIONS.tintColor);
 
-    // Stages: 0 PNG -> 1 orange PNG -> 2 GIF -> 0 ...
-    function iconForStage(stage) {
-      if (stage === 1) return orangePNG;
-      if (stage === 2) return gifIMG;
-      return basePNG;
+    // Natural sizes
+    const baseW = basePNG.naturalWidth || basePNG.width;
+    const baseH = basePNG.naturalHeight || basePNG.height;
+    const gifW  = gifIMG.naturalWidth  || gifIMG.width;
+    const gifH  = gifIMG.naturalHeight || gifIMG.height;
+
+    // Target sizes (preserve aspect)
+    const PNG_W  = Math.round(baseW * (OPTIONS.targetH / baseH));
+    const PNG_H  = OPTIONS.targetH;
+    const GIF_W  = Math.round(gifW  * (OPTIONS.targetH / gifH));
+    const GIF_H  = OPTIONS.targetH;
+
+    // Stage helpers
+    const EPS = 0.75;
+    const W = () => stage.clientWidth;
+    const H = () => stage.clientHeight;
+
+    function clampedSpeed(vx, vy) {
+      const mag = Math.hypot(vx, vy) || 1;
+      if (mag <= OPTIONS.maxSpeed) return {vx, vy};
+      const k = OPTIONS.maxSpeed / mag;
+      return {vx: vx * k, vy: vy * k};
     }
 
-    function sizeFor(img) {
-      const iw = img.naturalWidth || img.width;
-      const ih = img.naturalHeight || img.height;
-      const h = OPTIONS.iconTargetHeight;
-      return { w: Math.max(1, Math.round(iw * (h / ih))), h };
+    function setSpeedMag(sprite, newMag) {
+      const cur = Math.hypot(sprite.vx, sprite.vy) || 1;
+      const k = newMag / cur;
+      let vx = sprite.vx * k, vy = sprite.vy * k;
+      ({vx, vy} = clampedSpeed(vx, vy));
+      sprite.vx = vx; sprite.vy = vy;
     }
 
-    // ---------- Sprite ----------
-    const EPS = 0.75; // edge tolerance
-    const sprites = [];
+    function atEdgeX(x, w) {
+      return Math.abs(x - 0) <= EPS || Math.abs(x - (W() - w)) <= EPS;
+    }
+    function atEdgeY(y, h) {
+      return Math.abs(y - 0) <= EPS || Math.abs(y - (H() - h)) <= EPS;
+    }
+
+    // Stage 0 = PNG, 1 = orange PNG, 2 = GIF (animated). They only rank up on perfect corner.
+    function applyStage(sprite) {
+      if (sprite.stage === 0) {
+        sprite.el.src = OPTIONS.pngURL;
+        sprite.w = PNG_W; sprite.h = PNG_H;
+      } else if (sprite.stage === 1) {
+        sprite.el.src = orangeDataURL;
+        sprite.w = PNG_W; sprite.h = PNG_H;
+      } else {
+        sprite.el.src = OPTIONS.gifURL;
+        sprite.w = GIF_W; sprite.h = GIF_H;
+      }
+      // Apply size via CSS to ensure DOM img matches our math
+      sprite.el.style.width = sprite.w + "px";
+      sprite.el.style.height = sprite.h + "px";
+    }
 
     function randomAngleSeparated(prevAngle) {
       let a = Math.random() * Math.PI * 2;
@@ -123,104 +157,67 @@
       return a;
     }
 
-    function clampSpeed(vx, vy) {
-      const mag = Math.hypot(vx, vy) || 1;
-      if (mag <= OPTIONS.maxSpeed) return { vx, vy };
-      const k = OPTIONS.maxSpeed / mag;
-      return { vx: vx * k, vy: vy * k };
+    const sprites = [];
+
+    function rectOverlap(a, b) {
+      return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
     }
 
-    function createSprite(stageSeed = 0, prevAngle = null, positionTry = 12) {
-      const W = window.innerWidth;
-      const H = window.innerHeight;
+    function spawn(stageSeed = 0, prevAngle = null, attempts = 16) {
+      // build DOM node
+      const el = document.createElement("img");
+      el.className = "sprite";
+      stage.appendChild(el);
 
-      const stage = stageSeed % 3;
-      const icon = iconForStage(stage);
-      const iconSize = sizeFor(icon);
+      const sprite = {
+        el,
+        stage: stageSeed % 3, // all start as 0; we’ll pass 0 at init per your spec
+        x: 0, y: 0,
+        w: PNG_W, h: PNG_H,
+        vx: 0, vy: 0,
+        cooldownUntil: 0
+      };
+      sprite.stage = 0; // force start at chair PNG
+      applyStage(sprite);
 
+      // random non-overlapping position
       const pad = 3;
-      let x, y;
-      // Try a few times to avoid overlapping at spawn
-      for (let t = 0; t < positionTry; t++) {
-        x = Math.random() * Math.max(1, (W - iconSize.w - pad * 2)) + pad;
-        y = Math.random() * Math.max(1, (H - iconSize.h - pad * 2)) + pad;
-        let intersects = false;
+      for (let t = 0; t < attempts; t++) {
+        const nx = Math.random() * Math.max(1, (W() - sprite.w - pad*2)) + pad;
+        const ny = Math.random() * Math.max(1, (H() - sprite.h - pad*2)) + pad;
+        let collides = false;
         for (const s of sprites) {
-          if (rectOverlap(x, y, iconSize.w, iconSize.h, s.x, s.y, s.iconSize.w, s.iconSize.h)) {
-            intersects = true; break;
-          }
+          if (rectOverlap({x:nx,y:ny,w:sprite.w,h:sprite.h}, s)) { collides = true; break; }
         }
-        if (!intersects) break;
+        if (!collides) { sprite.x = nx; sprite.y = ny; break; }
       }
 
+      // velocity
       const a = randomAngleSeparated(prevAngle);
       let vx = Math.cos(a) * OPTIONS.startSpeed;
       let vy = Math.sin(a) * OPTIONS.startSpeed;
-      ({ vx, vy } = clampSpeed(vx, vy));
+      ({vx, vy} = clampedSpeed(vx, vy));
+      sprite.vx = vx; sprite.vy = vy;
 
-      return {
-        stage, icon, iconSize,
-        x, y, vx, vy,
-        cooldownUntil: 0
-      };
+      sprites.push(sprite);
+      return sprite;
     }
 
-    function advanceStage(s) {
-      s.stage = (s.stage + 1) % 3;
-      s.icon = iconForStage(s.stage);
-      const oldW = s.iconSize.w, oldH = s.iconSize.h;
-      s.iconSize = sizeFor(s.icon);
-      // Keep inside bounds if size changed
-      const W = window.innerWidth, H = window.innerHeight;
-      if (s.x + s.iconSize.w > W) s.x = W - s.iconSize.w;
-      if (s.y + s.iconSize.h > H) s.y = H - s.iconSize.h;
-      // Optional tiny positional nudge to reduce post-size-change overlaps
-      if (s.iconSize.w !== oldW || s.iconSize.h !== oldH) {
-        s.x = Math.max(0, Math.min(W - s.iconSize.w, s.x + Math.random()*2 - 1));
-        s.y = Math.max(0, Math.min(H - s.iconSize.h, s.y + Math.random()*2 - 1));
-      }
-    }
-
-    function setSpeedMag(s, newMag) {
-      const cur = Math.hypot(s.vx, s.vy) || 1;
-      const k = newMag / cur;
-      s.vx *= k; s.vy *= k;
-      const clamped = clampSpeed(s.vx, s.vy);
-      s.vx = clamped.vx; s.vy = clamped.vy;
-    }
-
-    function atEdgeX(px, w) {
-      const W = window.innerWidth;
-      return Math.abs(px - 0) <= EPS || Math.abs(px - (W - w)) <= EPS;
-    }
-    function atEdgeY(py, h) {
-      const H = window.innerHeight;
-      return Math.abs(py - 0) <= EPS || Math.abs(py - (H - h)) <= EPS;
-    }
-
-    function rectOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
-      return !(x1 + w1 <= x2 || x2 + w2 <= x1 || y1 + h1 <= y2 || y2 + h2 <= y1);
-    }
-
-    // --------- Init with startCount sprites ----------
+    // seed with exactly 3
     let prevA = null;
     for (let i = 0; i < OPTIONS.startCount; i++) {
-      const s = createSprite(i, prevA);
+      const s = spawn(0, prevA);
       prevA = Math.atan2(s.vy, s.vx);
-      sprites.push(s);
     }
 
-    // ---------- Main loop ----------
+    // physics loop
     let last = performance.now();
 
     function tick(now) {
       const dt = (now - last) / 1000;
       last = now;
 
-      const W = window.innerWidth;
-      const H = window.innerHeight;
-
-      // Move and wall collisions
+      // move + wall bounces
       for (const s of sprites) {
         let nx = s.x + s.vx * dt;
         let ny = s.y + s.vy * dt;
@@ -228,85 +225,67 @@
         let hitX = false, hitY = false;
 
         if (nx <= 0) { nx = 0; s.vx = Math.abs(s.vx); hitX = true; }
-        else if (nx + s.iconSize.w >= W) { nx = W - s.iconSize.w; s.vx = -Math.abs(s.vx); hitX = true; }
+        else if (nx + s.w >= W()) { nx = W() - s.w; s.vx = -Math.abs(s.vx); hitX = true; }
 
         if (ny <= 0) { ny = 0; s.vy = Math.abs(s.vy); hitY = true; }
-        else if (ny + s.iconSize.h >= H) { ny = H - s.iconSize.h; s.vy = -Math.abs(s.vy); hitY = true; }
+        else if (ny + s.h >= H()) { ny = H() - s.h; s.vy = -Math.abs(s.vy); hitY = true; }
 
         s.x = nx; s.y = ny;
 
-        // Perfect corner handling
-        const corner = (hitX && hitY) || (atEdgeX(s.x, s.iconSize.w) && atEdgeY(s.y, s.iconSize.h));
+        const corner = (hitX && hitY) || (atEdgeX(s.x, s.w) && atEdgeY(s.y, s.h));
         if (corner && now >= s.cooldownUntil) {
-          // Stage cycle
-          advanceStage(s);
+          // rank up: 0 -> 1 -> 2 -> 0 ...
+          s.stage = (s.stage + 1) % 3;
+          applyStage(s);
 
-          // Boost
-          const boosted = Math.min(OPTIONS.maxSpeed, Math.hypot(s.vx, s.vy) * OPTIONS.cornerSpeedBoost);
+          // speed boost
+          const boosted = Math.min(OPTIONS.maxSpeed, Math.hypot(s.vx, s.vy) * OPTIONS.boostOnCorner);
           setSpeedMag(s, boosted);
 
-          // Spawn a new sprite if allowed
-          if (OPTIONS.spawnOnCorner && sprites.length < OPTIONS.maxCount) {
-            const seed = sprites.length; // just to vary initial stage slightly
-            const newbie = createSprite(seed, Math.atan2(s.vy, s.vx));
-            sprites.push(newbie);
+          // spawn new if under cap
+          if (sprites.length < OPTIONS.maxCount) {
+            const newbie = spawn(0, Math.atan2(s.vy, s.vx));
           }
 
-          // Debounce
+          // debounce
           s.cooldownUntil = now + OPTIONS.cornerCooldownMs;
         }
       }
 
-      // Pairwise collisions (AABB) with simple elastic response
+      // pairwise AABB collisions with simple elastic response
       for (let i = 0; i < sprites.length; i++) {
         for (let j = i + 1; j < sprites.length; j++) {
           const A = sprites[i], B = sprites[j];
-          if (!rectOverlap(A.x, A.y, A.iconSize.w, A.iconSize.h, B.x, B.y, B.iconSize.w, B.iconSize.h)) continue;
+          if (!rectOverlap(A, B)) continue;
 
-          // Compute overlap along axes
-          const axCenter = A.x + A.iconSize.w / 2;
-          const ayCenter = A.y + A.iconSize.h / 2;
-          const bxCenter = B.x + B.iconSize.w / 2;
-          const byCenter = B.y + B.iconSize.h / 2;
+          const axC = A.x + A.w / 2, ayC = A.y + A.h / 2;
+          const bxC = B.x + B.w / 2, byC = B.y + B.h / 2;
 
-          const overlapX = (A.iconSize.w + B.iconSize.w) / 2 - Math.abs(axCenter - bxCenter);
-          const overlapY = (A.iconSize.h + B.iconSize.h) / 2 - Math.abs(ayCenter - byCenter);
-
+          const overlapX = (A.w + B.w) / 2 - Math.abs(axC - bxC);
+          const overlapY = (A.h + B.h) / 2 - Math.abs(ayC - byC);
           if (overlapX <= 0 || overlapY <= 0) continue;
 
-          // Resolve along the axis of least penetration
           if (overlapX < overlapY) {
             const push = overlapX / 2 + 0.1;
-            if (axCenter < bxCenter) {
-              A.x -= push; B.x += push;
-            } else {
-              A.x += push; B.x -= push;
-            }
-            // Swap X velocities for equal-mass elastic collision
+            if (axC < bxC) { A.x -= push; B.x += push; }
+            else { A.x += push; B.x -= push; }
             const tmp = A.vx; A.vx = B.vx; B.vx = tmp;
           } else {
             const push = overlapY / 2 + 0.1;
-            if (ayCenter < byCenter) {
-              A.y -= push; B.y += push;
-            } else {
-              A.y += push; B.y -= push;
-            }
-            // Swap Y velocities
+            if (ayC < byC) { A.y -= push; B.y += push; }
+            else { A.y += push; B.y -= push; }
             const tmp = A.vy; A.vy = B.vy; B.vy = tmp;
           }
 
-          // Keep speeds within cap
-          ({ vx: A.vx, vy: A.vy } = clampSpeed(A.vx, A.vy));
-          ({ vx: B.vx, vy: B.vy } = clampSpeed(B.vx, B.vy));
+          // clamp speeds
+          ({vx: A.vx, vy: A.vy} = clampedSpeed(A.vx, A.vy));
+          ({vx: B.vx, vy: B.vy} = clampedSpeed(B.vx, B.vy));
         }
       }
 
-      // Draw
-      ctx.clearRect(0, 0, W, H);
+      // draw (via CSS transform so GIFs animate naturally)
       for (const s of sprites) {
-        if (s.icon && s.icon.complete) {
-          ctx.drawImage(s.icon, Math.round(s.x), Math.round(s.y), s.iconSize.w, s.iconSize.h);
-        }
+        s.el.style.transform = `translate(${Math.round(s.x)}px, ${Math.round(s.y)}px)`;
       }
 
       requestAnimationFrame(tick);
@@ -314,19 +293,22 @@
 
     requestAnimationFrame(tick);
   }).catch(err => {
-    console.error("Failed to load images:", err);
-    // Minimal fallback so source isn't blank
-    let last = performance.now(), x=10,y=10,vx=220,vy=180,w=100,h=100;
+    console.error("Asset load failed:", err);
+    // visual fallback: a single bouncing div so OBS isn't blank
+    const box = document.createElement("div");
+    box.style.position = "absolute";
+    box.style.width = "100px";
+    box.style.height = "100px";
+    box.style.background = "rgba(255,255,255,0.8)";
+    stage.appendChild(box);
+    let x=10,y=10,vx=200,vy=160,last=performance.now();
     function loop(now){
       const dt=(now-last)/1000; last=now;
       x+=vx*dt; y+=vy*dt;
-      const W=window.innerWidth,H=window.innerHeight;
-      if(x<0||x+w>W)vx*=-1;
-      if(y<0||y+h>H)vy*=-1;
-      const ctx=c.getContext("2d");
-      ctx.clearRect(0,0,W,H);
-      ctx.fillStyle="rgba(255,255,255,0.85)";
-      ctx.fillRect(x,y,w,h);
+      const W=stage.clientWidth,H=stage.clientHeight;
+      if(x<0||x+100>W)vx*=-1;
+      if(y<0||y+100>H)vy*=-1;
+      box.style.transform=`translate(${x}px,${y}px)`;
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
