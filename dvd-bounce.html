@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>DVD Bounce Overlay</title>
+  <title>DVD Bounce — Swarm</title>
   <style>
     html, body {
       margin: 0;
@@ -10,222 +10,323 @@
       background: transparent;
       overflow: hidden;
     }
-    canvas {
-      display: block;
-      width: 100vw;
-      height: 100vh;
+    #stage {
+      position: relative;
+      /* we'll size this in JS to exact pixels so OBS always reports non-zero */
+      background: transparent;
+      overflow: hidden;
+    }
+    .sprite {
+      position: absolute;
+      will-change: transform;
+      image-rendering: auto;
+      pointer-events: none;
+      user-select: none;
     }
   </style>
 </head>
 <body>
-<canvas id="c"></canvas>
+<div id="stage"></div>
+
 <script>
 (() => {
-  // ---------- Customize ----------
   const OPTIONS = {
-    // Your assets
-    pngURL: "https://i.imgur.com/n6hDfJt.png",  // 74x112 PNG
-    gifURL: "https://i.imgur.com/6CXMtbT.gif",  // 112x112 GIF
+    pngURL: "https://i.imgur.com/n6hDfJt.png",   // chair PNG (74x112)
+    gifURL: "https://i.imgur.com/6CXMtbT.gif",   // animated GIF (112x112)
+    tintColor: "#ffa500",                        // orange rank
 
-    // Size control: icon will be drawn at this target HEIGHT, width keeps aspect automatically
-    iconTargetHeight: 112,
-
-    // Motion
-    speed: 280,             // pixels per second
-    cornerCooldownMs: 400,  // debounce so one corner counts once
-
-    // Tints
-    orange: "#ffa500",
-    purple: "#9b5de5"
+    targetH: 112,         // drawn height (px), width keeps aspect
+    startCount: 3,
+    maxCount: 6,          // hard cap
+    startSpeed: 280,      // px/s
+    boostOnCorner: 1.06,  // 6% bump per perfect corner
+    maxSpeed: 800,        // clamp
+    cornerCooldownMs: 350,
+    minAngleSeparationDeg: 12
   };
 
-  // Optional URL overrides:
-  // ?h=128&speed=360&png=URL&gif=URL
+  // Optional URL overrides
   const qs = new URLSearchParams(location.search);
-  if (qs.has("h"))     OPTIONS.iconTargetHeight = Math.max(8, +qs.get("h") || OPTIONS.iconTargetHeight);
-  if (qs.has("speed")) OPTIONS.speed = Math.max(20, +qs.get("speed") || OPTIONS.speed);
-  if (qs.has("png"))   OPTIONS.pngURL = qs.get("png");
-  if (qs.has("gif"))   OPTIONS.gifURL = qs.get("gif");
+  if (qs.has("start")) OPTIONS.startCount = Math.max(1, +qs.get("start"));
+  if (qs.has("max"))   OPTIONS.maxCount   = Math.max(1, +qs.get("max"));
+  if (qs.has("h"))     OPTIONS.targetH    = Math.max(8, +qs.get("h"));
+  if (qs.has("speed")) OPTIONS.startSpeed = Math.max(20, +qs.get("speed"));
+  if (qs.has("boost")) OPTIONS.boostOnCorner = Math.max(1.0, +qs.get("boost"));
+  if (qs.has("cap"))   OPTIONS.maxSpeed   = Math.max(OPTIONS.startSpeed, +qs.get("cap"));
+  if (qs.has("png"))   OPTIONS.pngURL     = qs.get("png");
+  if (qs.has("gif"))   OPTIONS.gifURL     = qs.get("gif");
+  if (qs.has("color")) OPTIONS.tintColor  = qs.get("color");
 
-  // ---------- Canvas setup ----------
-  const canvas = document.getElementById("c");
-  const ctx = canvas.getContext("2d", { alpha: true });
+  const stage = document.getElementById("stage");
 
-  function resizeCanvas() {
-    canvas.width  = Math.floor(window.innerWidth  * devicePixelRatio);
-    canvas.height = Math.floor(window.innerHeight * devicePixelRatio);
-    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  // Ensure stage always has real pixel size (fixes 0x0 spawn bug in OBS)
+  function sizeStageToWindow() {
+    const w = Math.max(1, Math.floor(window.innerWidth));
+    const h = Math.max(1, Math.floor(window.innerHeight));
+    stage.style.width  = w + "px";
+    stage.style.height = h + "px";
+    return { w, h };
   }
-  resizeCanvas();
-  addEventListener("resize", resizeCanvas);
+  sizeStageToWindow();
+  addEventListener("resize", sizeStageToWindow);
 
-  // ---------- Load images ----------
-  function loadImage(url) {
-    return new Promise((resolve, reject) => {
+  // Helpers to read current stage size
+  const W = () => stage.clientWidth  || Math.max(1, Math.floor(window.innerWidth));
+  const H = () => stage.clientHeight || Math.max(1, Math.floor(window.innerHeight));
+
+  // Image loading with CORS so Imgur is happy
+  function loadImg(src) {
+    return new Promise((res, rej) => {
       const img = new Image();
       img.decoding = "async";
       img.crossOrigin = "anonymous";
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = url;
+      img.onload = () => res(img);
+      img.onerror = (e) => rej(e);
+      img.src = src;
     });
   }
 
-  // Pre-tint helper uses offscreen canvas and caches results
-  function makeTinted(img, color) {
-    const w = img.naturalWidth || img.width;
-    const h = img.naturalHeight || img.height;
+  function makeTinted(srcImg, color) {
+    const w = srcImg.naturalWidth || srcImg.width;
+    const h = srcImg.naturalHeight || srcImg.height;
     const off = document.createElement("canvas");
-    off.width = w;
-    off.height = h;
-    const octx = off.getContext("2d");
-    octx.drawImage(img, 0, 0, w, h);
-    octx.globalCompositeOperation = "source-atop";
-    octx.fillStyle = color;
-    octx.globalAlpha = 1.0;
-    octx.fillRect(0, 0, w, h);
-    octx.globalCompositeOperation = "source-over";
-    octx.globalAlpha = 1.0;
-    const tinted = new Image();
-    tinted.src = off.toDataURL("image/png");
-    return tinted;
+    off.width = w; off.height = h;
+    const ctx = off.getContext("2d");
+    ctx.drawImage(srcImg, 0, 0, w, h);
+    ctx.globalCompositeOperation = "source-atop";
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = "source-over";
+    return off.toDataURL("image/png");
   }
 
-  Promise.all([loadImage(OPTIONS.pngURL), loadImage(OPTIONS.gifURL)])
-    .then(([basePNG, gifIMG]) => {
-      // Prepare tinted variants once
-      const tintedOrange = makeTinted(basePNG, OPTIONS.orange);
-      const tintedPurple = makeTinted(basePNG, OPTIONS.purple);
+  Promise.all([loadImg(OPTIONS.pngURL), loadImg(OPTIONS.gifURL)]).then(([basePNG, gifIMG]) => {
+    const orangeDataURL = makeTinted(basePNG, OPTIONS.tintColor);
 
-      // Stage mapping:
-      // 0 normal PNG, 1 orange, 2 purple, 3 GIF
-      function currentIconForStage(stage) {
-        switch (stage) {
-          case 1: return tintedOrange;
-          case 2: return tintedPurple;
-          case 3: return gifIMG;
-          default: return basePNG;
+    const baseW = basePNG.naturalWidth || basePNG.width;
+    const baseH = basePNG.naturalHeight || basePNG.height;
+    const gifW  = gifIMG.naturalWidth  || gifIMG.width;
+    const gifH  = gifIMG.naturalHeight || gifIMG.height;
+
+    const PNG_W = Math.round(baseW * (OPTIONS.targetH / baseH));
+    const PNG_H = OPTIONS.targetH;
+    const GIF_W = Math.round(gifW  * (OPTIONS.targetH / gifH));
+    const GIF_H = OPTIONS.targetH;
+
+    // Physics + sprites
+    const sprites = [];
+    const EPS = 0.75;
+
+    function clampedSpeed(vx, vy) {
+      const mag = Math.hypot(vx, vy) || 1;
+      if (mag <= OPTIONS.maxSpeed) return { vx, vy };
+      const k = OPTIONS.maxSpeed / mag;
+      return { vx: vx * k, vy: vy * k };
+    }
+    function setSpeedMag(s, newMag) {
+      const cur = Math.hypot(s.vx, s.vy) || 1;
+      const k = newMag / cur;
+      let vx = s.vx * k, vy = s.vy * k;
+      ({vx, vy} = clampedSpeed(vx, vy));
+      s.vx = vx; s.vy = vy;
+    }
+    function atEdgeX(x, w) { return Math.abs(x - 0) <= EPS || Math.abs(x - (W() - w)) <= EPS; }
+    function atEdgeY(y, h) { return Math.abs(y - 0) <= EPS || Math.abs(y - (H() - h)) <= EPS; }
+
+    function applyStage(s) {
+      // 0 = PNG, 1 = orange PNG, 2 = GIF
+      if (s.stage === 0) {
+        s.el.src = OPTIONS.pngURL; s.w = PNG_W; s.h = PNG_H;
+      } else if (s.stage === 1) {
+        s.el.src = orangeDataURL;  s.w = PNG_W; s.h = PNG_H;
+      } else {
+        s.el.src = OPTIONS.gifURL; s.w = GIF_W; s.h = GIF_H;
+      }
+      s.el.style.width  = s.w + "px";
+      s.el.style.height = s.h + "px";
+    }
+
+    function rectOverlap(a, b) {
+      return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+    }
+
+    function randomAngleSeparated(prevAngle) {
+      let a = Math.random() * Math.PI * 2;
+      if (prevAngle != null) {
+        const sep = OPTIONS.minAngleSeparationDeg * Math.PI / 180;
+        if (Math.abs(a - prevAngle) < sep) a += sep;
+      }
+      return a;
+    }
+
+    function spawn(prevAngle = null, attempts = 24) {
+      const el = document.createElement("img");
+      el.className = "sprite";
+      stage.appendChild(el);
+
+      const s = {
+        el, stage: 0, // start as chair
+        x: 0, y: 0, w: PNG_W, h: PNG_H,
+        vx: 0, vy: 0,
+        cooldownUntil: 0
+      };
+      applyStage(s);
+
+      const pad = 3;
+      const width  = W();
+      const height = H();
+
+      // If stage somehow still 0x0, delay spawn a tick
+      if (width <= 0 || height <= 0) {
+        requestAnimationFrame(() => spawn(prevAngle, attempts));
+        el.remove();
+        return null;
+      }
+
+      for (let t = 0; t < attempts; t++) {
+        const nx = Math.random() * Math.max(1, (width - s.w - pad * 2)) + pad;
+        const ny = Math.random() * Math.max(1, (height - s.h - pad * 2)) + pad;
+        let collides = false;
+        for (const o of sprites) {
+          if (rectOverlap({ x: nx, y: ny, w: s.w, h: s.h }, o)) { collides = true; break; }
         }
+        if (!collides) { s.x = nx; s.y = ny; break; }
       }
 
-      // Icon sizing based on current sprite aspect, target height fixed
-      function sizeFor(img) {
-        const iw = img.naturalWidth || img.width;
-        const ih = img.naturalHeight || img.height;
-        const targetH = OPTIONS.iconTargetHeight;
-        const targetW = Math.max(1, Math.round(iw * (targetH / ih)));
-        return { w: targetW, h: targetH };
+      const a = randomAngleSeparated(prevAngle);
+      let vx = Math.cos(a) * OPTIONS.startSpeed;
+      let vy = Math.sin(a) * OPTIONS.startSpeed;
+      ({ vx, vy } = clampedSpeed(vx, vy));
+      s.vx = vx; s.vy = vy;
+
+      sprites.push(s);
+      return s;
+    }
+
+    // Wait until stage has size, then seed exactly 3
+    function seedWhenReady() {
+      if (W() > 0 && H() > 0) {
+        let prevA = null;
+        for (let i = 0; i < OPTIONS.startCount; i++) {
+          const s = spawn(prevA);
+          if (s) prevA = Math.atan2(s.vy, s.vx);
+        }
+        startLoop();
+      } else {
+        requestAnimationFrame(seedWhenReady);
       }
+    }
 
-      // ---------- Motion ----------
-      let cornerHits = 0;
-      let stage = 0; // 0..3 cycles
-      let icon = currentIconForStage(stage);
-      let iconSize = sizeFor(icon);
-
-      function updateStage() {
-        stage = (cornerHits % 4);
-        icon = currentIconForStage(stage);
-        iconSize = sizeFor(icon);
-      }
-
-      const EPS = 0.75; // sub-pixel tolerance
-      let cooldownUntil = 0;
-
-      // Start position and velocity
-      let W = () => window.innerWidth;
-      let H = () => window.innerHeight;
-
-      // place away from edges
-      let x = Math.random() * Math.max(1, (W() - iconSize.w - 1)) + 0.5;
-      let y = Math.random() * Math.max(1, (H() - iconSize.h - 1)) + 0.5;
-
-      function randomVelocity(speed) {
-        const a = Math.random() * Math.PI * 2;
-        return { vx: Math.cos(a) * speed, vy: Math.sin(a) * speed };
-      }
-      let { vx, vy } = randomVelocity(OPTIONS.speed);
-
-      function atEdgeX(px, w) {
-        return Math.abs(px - 0) <= EPS || Math.abs(px - (W() - w)) <= EPS;
-      }
-      function atEdgeY(py, h) {
-        return Math.abs(py - 0) <= EPS || Math.abs(py - (H() - h)) <= EPS;
-      }
-
-      let last = performance.now();
-
-      function loop(now) {
+    let last = performance.now();
+    function startLoop() {
+      function tick(now) {
         const dt = (now - last) / 1000;
         last = now;
 
-        let nx = x + vx * dt;
-        let ny = y + vy * dt;
+        // Move + wall bounces
+        for (const s of sprites) {
+          let nx = s.x + s.vx * dt;
+          let ny = s.y + s.vy * dt;
 
-        let hitX = false, hitY = false;
+          let hitX = false, hitY = false;
 
-        // Reflect X
-        if (nx <= 0) {
-          nx = 0;
-          vx = Math.abs(vx);
-          hitX = true;
-        } else if (nx + iconSize.w >= W()) {
-          nx = W() - iconSize.w;
-          vx = -Math.abs(vx);
-          hitX = true;
+          if (nx <= 0) { nx = 0; s.vx = Math.abs(s.vx); hitX = true; }
+          else if (nx + s.w >= W()) { nx = W() - s.w; s.vx = -Math.abs(s.vx); hitX = true; }
+
+          if (ny <= 0) { ny = 0; s.vy = Math.abs(s.vy); hitY = true; }
+          else if (ny + s.h >= H()) { ny = H() - s.h; s.vy = -Math.abs(s.vy); hitY = true; }
+
+          s.x = nx; s.y = ny;
+
+          const corner = (hitX && hitY) || (atEdgeX(s.x, s.w) && atEdgeY(s.y, s.h));
+          if (corner && now >= s.cooldownUntil) {
+            // rank up
+            s.stage = (s.stage + 1) % 3;
+            const oldW = s.w, oldH = s.h;
+            applyStage(s);
+
+            // Keep inside if size changed
+            if (s.x + s.w > W()) s.x = W() - s.w;
+            if (s.y + s.h > H()) s.y = H() - s.h;
+
+            // speed boost
+            const boosted = Math.min(OPTIONS.maxSpeed, Math.hypot(s.vx, s.vy) * OPTIONS.boostOnCorner);
+            setSpeedMag(s, boosted);
+
+            // spawn new until cap
+            if (sprites.length < OPTIONS.maxCount) {
+              spawn(Math.atan2(s.vy, s.vx));
+            }
+
+            s.cooldownUntil = now + OPTIONS.cornerCooldownMs;
+          }
         }
 
-        // Reflect Y
-        if (ny <= 0) {
-          ny = 0;
-          vy = Math.abs(vy);
-          hitY = true;
-        } else if (ny + iconSize.h >= H()) {
-          ny = H() - iconSize.h;
-          vy = -Math.abs(vy);
-          hitY = true;
-        }
+        // Pairwise AABB collisions
+        for (let i = 0; i < sprites.length; i++) {
+          for (let j = i + 1; j < sprites.length; j++) {
+            const A = sprites[i], B = sprites[j];
+            if (!rectOverlap(A, B)) continue;
 
-        x = nx;
-        y = ny;
+            const axC = A.x + A.w / 2, ayC = A.y + A.h / 2;
+            const bxC = B.x + B.w / 2, byC = B.y + B.h / 2;
 
-        // Corner detection with cooldown
-        const isCorner = (hitX && hitY) || (atEdgeX(x, iconSize.w) && atEdgeY(y, iconSize.h));
-        if (isCorner && now >= cooldownUntil) {
-          cornerHits += 1;
-          updateStage();
-          cooldownUntil = now + OPTIONS.cornerCooldownMs;
+            const overlapX = (A.w + B.w) / 2 - Math.abs(axC - bxC);
+            const overlapY = (A.h + B.h) / 2 - Math.abs(ayC - byC);
+            if (overlapX <= 0 || overlapY <= 0) continue;
+
+            if (overlapX < overlapY) {
+              const push = overlapX / 2 + 0.1;
+              if (axC < bxC) { A.x -= push; B.x += push; }
+              else { A.x += push; B.x -= push; }
+              const tvx = A.vx; A.vx = B.vx; B.vx = tvx;
+            } else {
+              const push = overlapY / 2 + 0.1;
+              if (ayC < byC) { A.y -= push; B.y += push; }
+              else { A.y += push; B.y -= push; }
+              const tvy = A.vy; A.vy = B.vy; B.vy = tvy;
+            }
+
+            ({ vx: A.vx, vy: A.vy } = clampedSpeed(A.vx, A.vy));
+            ({ vx: B.vx, vy: B.vy } = clampedSpeed(B.vx, B.vy));
+          }
         }
 
         // Draw
-        ctx.clearRect(0, 0, W(), H());
-        if (icon && icon.complete) {
-          ctx.drawImage(icon, Math.round(x), Math.round(y), iconSize.w, iconSize.h);
+        for (const s of sprites) {
+          s.el.style.transform = `translate(${Math.round(s.x)}px, ${Math.round(s.y)}px)`;
         }
 
-        requestAnimationFrame(loop);
+        requestAnimationFrame(tick);
       }
+      requestAnimationFrame(tick);
+    }
 
-      // Start when first icon is ready
+    // Kick everything off after stage has non-zero size
+    seedWhenReady();
+
+  }).catch(err => {
+    console.error("Asset load failed:", err);
+    // emergency fallback block
+    sizeStageToWindow();
+    const box = document.createElement("div");
+    box.style.position = "absolute";
+    box.style.width = "100px";
+    box.style.height = "100px";
+    box.style.background = "rgba(255,255,255,0.8)";
+    stage.appendChild(box);
+    let x=10,y=10,vx=200,vy=160,last=performance.now();
+    function loop(now){
+      const dt=(now-last)/1000; last=now;
+      const width=W(), height=H();
+      x+=vx*dt; y+=vy*dt;
+      if(x<0||x+100>width)vx*=-1;
+      if(y<0||y+100>height)vy*=-1;
+      box.style.transform=`translate(${x}px,${y}px)`;
       requestAnimationFrame(loop);
-    })
-    .catch(err => {
-      console.error("Failed to load images", err);
-      // Minimal fallback to avoid a blank source
-      let last = performance.now(), x = 10, y = 10, vx = 200, vy = 160, w = 100, h = 100;
-      function loop(now) {
-        const dt = (now - last) / 1000; last = now;
-        x += vx * dt; y += vy * dt;
-        if (x < 0 || x + w > window.innerWidth)  vx *= -1;
-        if (y < 0 || y + h > window.innerHeight) vy *= -1;
-        const ctx = c.getContext("2d");
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        ctx.fillStyle = "rgba(255,255,255,0.85)";
-        ctx.fillRect(x, y, w, h);
-        requestAnimationFrame(loop);
-      }
-      requestAnimationFrame(loop);
-    });
+    }
+    requestAnimationFrame(loop);
+  });
 })();
 </script>
 </body>
